@@ -4,6 +4,168 @@ import re
 import os
 from datetime import datetime
 
+# AI categorization imports
+try:
+    from transformers import pipeline
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
+    print("⚠️  Hugging Face transformers not installed. Install with: pip install transformers torch")
+
+# Global classifier variable to avoid reloading
+classifier = None
+
+def initialize_classifier():
+    """Initialize the Hugging Face classifier (one-time setup)"""
+    global classifier
+    
+    if not HF_AVAILABLE:
+        print("❌ Hugging Face transformers not available. Skipping AI categorization.")
+        return False
+    
+    if classifier is None:
+        print("🤖 Loading AI model for transaction categorization...")
+        print("📥 This may take a few minutes on first run (downloading ~500MB model)...")
+        
+        try:
+            # Use zero-shot classification model
+            classifier = pipeline("zero-shot-classification", 
+                                model="facebook/bart-large-mnli")
+            print("✅ AI model loaded successfully!")
+            return True
+        except Exception as e:
+            print(f"❌ Error loading AI model: {e}")
+            return False
+    
+    return True
+
+def categorize_transaction(description):
+    """Categorize a transaction using hybrid approach: keywords first, then AI"""
+    
+    # First, try rule-based categorization for obvious cases
+    rule_based_category = fallback_categorization(description)
+    
+    # If rule-based found a specific category (not Miscellaneous), use it
+    if rule_based_category != "Miscellaneous":
+        return rule_based_category
+    
+    # Otherwise, use AI for ambiguous cases
+    global classifier
+    
+    if classifier is None:
+        return "Miscellaneous"
+    
+    # Define categories for classification (using clean names directly)
+    candidate_labels = [
+        "Food & Dining",
+        "Transportation", 
+        "Shopping",
+        "Entertainment",
+        "Subscriptions",
+        "Healthcare",
+        "ATM/Cash",
+        "Transfer",
+        "Groceries"
+    ]
+    
+    try:
+        result = classifier(description, candidate_labels)
+        
+        # Get the top prediction and its confidence score
+        top_category = result['labels'][0]
+        top_confidence = result['scores'][0]
+        
+        # Only return the category if confidence is high enough
+        # Otherwise return Miscellaneous
+        confidence_threshold = 0.7  # Adjust this value (0.0 to 1.0)
+        
+        if top_confidence >= confidence_threshold:
+            return top_category
+        else:
+            print(f"⚠️  Low confidence ({top_confidence:.2f}) for '{description}' → Miscellaneous")
+            return "Miscellaneous"
+        
+    except Exception as e:
+        print(f"⚠️  Error categorizing '{description}': {e}")
+        return "Miscellaneous"
+
+def fallback_categorization(description):
+    """Enhanced rule-based categorization for obvious cases"""
+    desc_lower = description.lower()
+    
+    categories = {
+        'Food & Dining': [
+            # Fast food chains
+            'mcdonald', 'tim horton', 'burger king', 'kfc', 'subway', 'pizza',
+            'starbucks', 'coffee', 'restaurant', 'cafe', 'diner', 'wendy',
+            'taco bell', 'popeyes', 'a&w', 'dairy queen', 'harveys',
+            # Food keywords
+            'resto', 'bistro', 'grill', 'kitchen', 'bar & grill',
+            # Your specific transactions
+            'golden fish', 'arby', 'nuri village', 'yogurt', 'poke'
+        ],
+        'Transportation': [
+            'uber', 'lyft', 'taxi', 'gas', 'petro', 'shell', 'esso', 'parking',
+            'transit', 'go train', 'ttc', 'presto', 'via rail'
+        ],
+        'Shopping': [
+            'amazon', 'walmart', 'target', 'costco', 'canadian tire', 'home depot',
+            'loblaws', 'shoppers', 'best buy', 'future shop'
+        ],
+        'Entertainment': [
+            'netflix', 'spotify', 'movie', 'cinema', 'theatre', 'concert',
+            'waterloo star'  # seems like entertainment venue
+        ],
+        'Subscriptions': [
+            'spotify', 'netflix', 'apple music', 'subscription', 'monthly fee',
+            'gym membership', 'planet fitness'
+        ],
+        'Transfer': [
+            'trsf', 'transfer', 'e-transfer', 'interac', 'payment to'
+        ],
+        'ATM/Cash': [
+            'atm', 'cash withdrawal', 'bank machine'
+        ],
+        'Healthcare': [
+            'pharmacy', 'shoppers drug', 'medical', 'doctor', 'hospital',
+            'dental', 'clinic', 'health'
+        ],
+        'Groceries': [
+            'loblaws', 'metro', 'sobeys', 'food basics', 'no frills',
+            'supermarket', 'grocery', 'fresh'
+        ],
+        'Miscellaneous': [
+            'hi yogurt'  # unclear what this is
+        ]
+    }
+    
+    # Check each category
+    for category, keywords in categories.items():
+        if any(keyword in desc_lower for keyword in keywords):
+            return category
+    
+    return 'Miscellaneous'
+
+def add_categories_to_dataframe(df):
+    """Add category column to the dataframe"""
+    if len(df) == 0:
+        return df
+    
+    # Initialize AI if available
+    ai_available = initialize_classifier()
+    
+    print(f"🏷️  Categorizing {len(df)} transactions...")
+    
+    # Add categories to the dataframe
+    if ai_available:
+        print("🤖 Using hybrid categorization (keywords + AI)...")
+        df['Category'] = df['Description'].apply(categorize_transaction)
+    else:
+        print("📝 Using rule-based categorization...")
+        df['Category'] = df['Description'].apply(fallback_categorization)
+    
+    return df
+
 def extract_bmo_transactions(pdf_path):
     doc = fitz.open(pdf_path)
     full_text = ""
@@ -78,6 +240,10 @@ def extract_bmo_transactions(pdf_path):
         i += 1
     
     df = pd.DataFrame(transactions, columns=["Transaction Date", "Posted Date", "Description", "Amount"])
+    
+    # Add categories to the dataframe
+    df = add_categories_to_dataframe(df)
+    
     return df
 
 def get_month_year_from_transactions(df):
@@ -150,11 +316,12 @@ def append_to_log(new_df, log_file="bmo_transactions_log.xlsx"):
     return combined_df, year, month
 
 def main():
-    pdf_file = "June 5, 2025.pdf"
+    pdf_file = "May 5, 2025.pdf"
     log_file = "bmo_transactions_log.xlsx"
     
     # Extract transactions from PDF
     df = extract_bmo_transactions(pdf_file)
+    pd.options.display.float_format = '${:,.2f}'.format
     
     if len(df) == 0:
         print("❌ No transactions found. Let me debug...")
@@ -188,6 +355,15 @@ def main():
             monthly_summary.columns = ["Transaction Count", "Total Amount"]
             print("\n📊 Monthly Summary:")
             print(monthly_summary)
+        
+        # Show category breakdown for latest month
+        if "Category" in df.columns:
+            print(f"\n🏷️  Category breakdown for {month} {year}:")
+            category_summary = df.groupby("Category").agg({
+                "Amount": ["count", "sum"]
+            }).round(2)
+            category_summary.columns = ["Count", "Total Amount"]
+            print(category_summary)
         
         print(f"\n📝 Latest transactions from {month} {year}:")
         print(df.head())
